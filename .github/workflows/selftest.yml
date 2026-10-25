@@ -1,0 +1,16 @@
+name: selftest
+on: [push, pull_request]
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: protocol vectors
+        run: uv run --script scripts/qcywatch selftest
+      - name: image codec + container vectors
+        run: uv run --script scripts/facekit.py selftest
+      - name: generate and validate a face
+        run: |
+          uv run --script scripts/makeface.py out --accent '#3ddc97'
+          uv run --script scripts/facekit.py check out/face.bin

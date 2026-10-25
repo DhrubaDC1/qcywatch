@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+docs/img/.work/
+out/
+*.bin

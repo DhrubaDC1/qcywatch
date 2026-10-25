@@ -1,0 +1,230 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["bleak>=0.22,<4"]
+# ///
+"""Control a QCY Watch GT2 (SMA "smable3" protocol over Nordic UART) from Linux.
+
+usage: qcywatch [--addr MAC] info|battery|find|time|notify TITLE BODY|face FILE|selftest
+"""
+import argparse
+import asyncio
+import os
+import struct
+import subprocess
+import sys
+from datetime import datetime
+
+ADDR = os.environ.get("QCY_WATCH")  # optional; otherwise the first watch advertising WATCH_NAME is used
+WATCH_NAME = "QCY Watch GT2"
+WRITE = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+NOTIFY = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+# (command, key) pairs from com.szabh.smable3.BleKey
+SESSION, POWER, FIND_WATCH = (0x03, 0x02), (0x02, 0x03), (0x02, 0x34)
+TIME, TIME_ZONE, DEVICE_INFO, NOTIFICATION = (0x02, 0x01), (0x02, 0x02), (0x02, 0x3E), (0x04, 0x01)
+WATCH_FACE = (0x07, 0x01)
+UPDATE, READ, CREATE = 0x00, 0x10, 0x20
+FACE_CHUNK = 1018  # the GT2's IO buffer size, as used by the QCY app
+
+
+def crc16_arc(data):
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def frame(cmd_key, flag, data=b""):
+    body = bytes([*cmd_key, flag]) + data
+    return struct.pack(">BBHH", 0xAB, 0x01, len(body), crc16_arc(body)) + body
+
+
+def time_bytes(t):
+    return bytes([t.year - 2000, t.month, t.day, t.hour, t.minute, t.second])
+
+
+def fixed(text, size):
+    return text.encode()[:size].ljust(size, b"\0")
+
+
+def notification(title, body):
+    # BleNotification.encode: category, time, package[32], title[<=31 + NUL pad to 32], content[<=250]
+    content = body.encode()
+    if len(content) > 250:
+        content = body.encode()[:247].decode(errors="ignore").encode() + "…".encode()
+    title_b = title.encode()[:31].decode(errors="ignore")
+    return bytes([127]) + time_bytes(datetime.now()) + fixed("com.android.mms", 32) + fixed(title_b, 32) + content
+
+
+def check_face(data):
+    # SMA watchface container: u16 images, u8 elements, u8 format, 20-byte records, u32 sizes, image data
+    try:
+        nimg, nel, _ = struct.unpack_from("<HBB", data, 0)
+        sizes = struct.unpack_from(f"<{nimg}I", data, 4 + nel * 20)
+    except struct.error:
+        sizes, nel = (), 0
+    if not nel or 4 + nel * 20 + len(sizes) * 4 + sum(sizes) != len(data):
+        sys.exit("not a valid watch face file")
+
+
+def stream_packet(total, offset, chunk):
+    # BleStreamPacket: type(0), total size, offset, data
+    return struct.pack(">BII", 0, total, offset) + chunk
+
+
+async def upload_face(w, data):
+    off, busy = 0, 0
+    while off < len(data):
+        r = await w.send(WATCH_FACE, UPDATE, stream_packet(len(data), off, data[off:off + FACE_CHUNK]))
+        status, _, nxt = struct.unpack(">BII", r[:9])
+        if status:  # 0x14 while the watch prepares flash; the app just resends the same chunk
+            busy += 1
+            if busy > 30:
+                sys.exit(f"watch refused the face (status {status:#x})")
+            await asyncio.sleep(1)
+            continue
+        if nxt <= off:
+            sys.exit(f"watch asked for offset {nxt} after {off}")
+        off = nxt
+        print(f"\rupload {off * 100 // len(data)}%", end="", flush=True)
+    print()
+
+
+class Watch:
+    def __init__(self, client):
+        self.client, self.buf, self.replies = client, bytearray(), asyncio.Queue()
+
+    def _on_notify(self, _char, data):
+        if not self.buf and data[:1] != b"\xab":
+            return
+        self.buf += data
+        if len(self.buf) >= 4 and len(self.buf) >= struct.unpack(">H", self.buf[2:4])[0] + 6:
+            f, self.buf = bytes(self.buf), bytearray()
+            if crc16_arc(f[6:]) != struct.unpack(">H", f[4:6])[0]:
+                print("warning: bad CRC from watch", f.hex(), file=sys.stderr)
+            elif f[1] & 0x20:
+                print("watch NACKed", f.hex(), file=sys.stderr)
+            self.replies.put_nowait(f)
+
+    async def send(self, cmd_key, flag, data=b""):
+        pkt = frame(cmd_key, flag, data)
+        size = max(20, self.client.mtu_size - 3)
+        for _ in range(3):  # BleMessenger.RETRY_MAX_TIMES
+            for i in range(0, len(pkt), size):
+                await self.client.write_gatt_char(WRITE, pkt[i:i + size], response=False)
+            try:
+                while True:  # stop-and-wait: the watch echoes cmd/key/flag in its reply
+                    f = await asyncio.wait_for(self.replies.get(), 5)
+                    if (f[6], f[7], f[8]) == (*cmd_key, flag):
+                        return f[9:]
+            except TimeoutError:
+                continue
+        raise TimeoutError
+
+
+async def run(args):
+    from bleak import BleakClient, BleakScanner
+    from bleak.exc import BleakDeviceNotFoundError
+
+    # The watch is dual-mode; make BlueZ prefer the LE bearer so it doesn't page Classic (needs BlueZ Experimental = true).
+    # It stops advertising once connected, so drop any stale LE link and find it by scan first.
+    def bluez(addr):
+        return "/org/bluez/hci0/dev_" + addr.upper().replace(":", "_")
+
+    if args.addr:
+        subprocess.run(["busctl", "call", "org.bluez", bluez(args.addr), "org.bluez.Bearer.LE1", "Disconnect"],
+                       capture_output=True, timeout=30)
+        device = await BleakScanner.find_device_by_address(args.addr, timeout=20)
+    else:
+        device = await BleakScanner.find_device_by_filter(
+            lambda d, ad: (ad.local_name or d.name or "").startswith(WATCH_NAME), timeout=20)
+    if device is None:
+        raise BleakDeviceNotFoundError(args.addr or WATCH_NAME)
+    path = bluez(device.address)
+    le = ["busctl", "call", "org.bluez", path, "org.bluez.Bearer.LE1"]
+    subprocess.run(["busctl", "set-property", "org.bluez", path, "org.bluez.Device1", "PreferredBearer", "s", "le"],
+                   capture_output=True, timeout=10)
+    client = BleakClient(device, timeout=30)
+    await client.connect()
+    # shortcut: private bleak BlueZ call to learn the negotiated MTU (else 23); drop if bleak exposes it publicly
+    if hasattr(client._backend, "_acquire_mtu"):
+        await client._backend._acquire_mtu()
+    try:
+        w = Watch(client)
+        await client.start_notify(NOTIFY, w._on_notify)
+        # the QCY app logs in with session id 0xFFFFFFFF; watch answers 00 on success
+        ok = await w.send(SESSION, CREATE, b"\xff\xff\xff\xff")
+        if ok[:1] != b"\x00":
+            sys.exit(f"login rejected: {ok.hex()}")
+        if args.cmd == "battery":
+            print(f"battery: {(await w.send(POWER, READ))[0]}%")
+        elif args.cmd == "find":
+            await w.send(FIND_WATCH, UPDATE, b"\x01")
+            print("watch is buzzing")
+        elif args.cmd == "time":
+            off = datetime.now().astimezone().utcoffset().total_seconds()
+            await w.send(TIME_ZONE, UPDATE, bytes([int(off // 900) & 0xFF]))  # quarter-hours
+            await w.send(TIME, UPDATE, time_bytes(datetime.now()))
+            print("time synced")
+        elif args.cmd == "notify":
+            await w.send(NOTIFICATION, UPDATE, notification(args.title, args.body))
+            print("sent")
+        elif args.cmd == "info":
+            d = await w.send(DEVICE_INFO, READ)
+            parts = [p.decode(errors="replace") for p in d[26:].split(b"\0") if p]
+            print(f"mac: {d[:17].decode()}\nname: {parts[0]}\nplatform/model/fw: {' / '.join(parts[1:])}")
+        elif args.cmd == "face":
+            await upload_face(w, args.data)
+            print("face installed")
+    finally:
+        # bleak's disconnect() waits for every bearer to drop and hangs while the watch holds its Classic link
+        subprocess.run(le + ["Disconnect"], capture_output=True, timeout=30)
+
+
+def selftest():
+    # frames captured from the QCY app talking to a GT2
+    assert frame(SESSION, CREATE, b"\xff" * 4).hex() == "ab010007b1b2030220ffffffff"
+    assert frame(POWER, READ).hex() == "ab010003fca0020310"
+    assert frame(FIND_WATCH, UPDATE, b"\x01").hex() == "ab010004b681023400" + "01"
+    assert frame(TIME, UPDATE, time_bytes(datetime(2026, 10, 25, 21, 52, 26))).hex() == "ab01000904c30201001a0a1915341a"
+    assert len(notification("t" * 50, "b" * 400)) == 1 + 6 + 32 + 32 + 250
+    # first face chunk header the app sent for its 219660-byte dial.bin
+    assert stream_packet(219660, 0, b"").hex() == "0000035a0c00000000"
+    print("selftest ok")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Control a QCY Watch GT2 over BLE")
+    p.add_argument("--addr", default=ADDR, help="watch BLE address (env QCY_WATCH); default: scan by name")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for c in ("info", "battery", "find", "time", "selftest"):
+        sub.add_parser(c)
+    n = sub.add_parser("notify")
+    n.add_argument("title")
+    n.add_argument("body")
+    sub.add_parser("face").add_argument("file", help="watch face .bin")
+    args = p.parse_args()
+    if args.cmd == "selftest":
+        return selftest()
+    if args.cmd == "face":
+        args.data = open(args.file, "rb").read()
+        check_face(args.data)
+    from bleak.exc import BleakCharacteristicNotFoundError, BleakDeviceNotFoundError
+
+    try:
+        asyncio.run(run(args))
+    except TimeoutError:
+        sys.exit("watch did not reply")
+    except BleakDeviceNotFoundError:
+        sys.exit("watch not advertising: it only accepts one connection, turn off your phone's Bluetooth first")
+    except BleakCharacteristicNotFoundError:
+        # the watch is dual-mode; a Classic bond on this PC makes BlueZ pick BR/EDR, which has no GATT
+        sys.exit("connected over Classic Bluetooth, not LE: set `Experimental = true` in /etc/bluetooth/main.conf, "
+                 "restart bluetooth, and retry")
+
+
+if __name__ == "__main__":
+    main()
